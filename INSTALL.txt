@@ -1,0 +1,8 @@
+Quick Install & Usage
+1) python -m venv .venv
+2) source .venv/bin/activate
+3) pip install --upgrade pip
+4) pip install -r requirements_polished.txt
+5) python app_polished.py
+6) pyinstaller --onedir --windowed --name iTechAccrual app_polished.py
+Do NOT commit builds, venv, or real payroll data.
