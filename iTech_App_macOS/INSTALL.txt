@@ -1,0 +1,28 @@
+iTech Accrual Updater - macOS Distribution v1.2
+
+INSTALLATION:
+1. Extract this folder anywhere
+2. Double-click "iTechAccrual.app"
+3. Application will launch
+
+FIRST USE:
+1. Click "Browse" → Select Master Excel file
+2. Click "Browse" → Select Paysheets folder
+3. Select Month and Year
+4. (Optional) Add Pay Dates with multipliers
+5. Check "Dry Run" (recommended first time!)
+6. Click "RUN UPDATE"
+7. Review the log output
+8. If correct, uncheck "Dry Run" and run again
+
+FEATURES:
+✓ Updates Accrual Hours (Column N)
+✓ Updates Billed to Client (Column O)
+✓ Calculates Admin Fee (Column T)
+✓ Handles OT rates automatically
+✓ Recursive folder search (finds paysheets in subfolders)
+✓ Automatic backups before changes
+✓ Full dry-run mode (preview before applying)
+
+SUPPORT:
+See Readme.md for detailed documentation

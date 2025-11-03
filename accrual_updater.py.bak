@@ -1,0 +1,1103 @@
+#!/usr/bin/env python3
+"""
+accrual_updater.py
+
+B/C-only paysheet parser and AccrualUpdater with improved admin-fee detection and fallback:
+- attach_project_blocks() scans a neighborhood for 'admin fee' and effective-date hints.
+- AccrualUpdater now falls back to the master admin column (if present) before using the default admin rate.
+- Hours are read only from immediate-right cell; payments prefer the cell right of hours and fallback to a detected payments header.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import shutil
+import sys
+import time
+from datetime import date, datetime
+from fractions import Fraction
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import openpyxl
+    from openpyxl.utils import get_column_letter, column_index_from_string
+    from openpyxl.worksheet.worksheet import Worksheet
+except Exception:
+    print("Missing dependency: openpyxl. Install: pip install openpyxl")
+    sys.exit(1)
+
+try:
+    import pandas as pd
+except Exception:
+    print("Missing dependency: pandas. Install: pip install pandas")
+    sys.exit(1)
+
+# optional .xls support via xlrd
+SUPPORT_XLS = True
+try:
+    import xlrd  # type: ignore
+except Exception:
+    SUPPORT_XLS = False
+
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+]
+
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def safe_float(x: Any) -> float:
+    try:
+        if x is None:
+            return 0.0
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip().replace(",", "")
+        s = s.replace("(", "-").replace(")", "")
+        if s == "" or s == "-":
+            return 0.0
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
+        return float(m.group(0)) if m else 0.0
+    except Exception:
+        return 0.0
+
+
+def extract_file_number_from_string(s: Any) -> Optional[str]:
+    if s is None:
+        return None
+    text = str(s)
+    m = re.search(r'(\d{5,6})', text)
+    if m:
+        return m.group(1)
+    digits = re.sub(r'\D', '', text)
+    if len(digits) >= 5:
+        return digits[:6]
+    return None
+
+
+def normalize_file_number(s: Any) -> Optional[str]:
+    if s is None:
+        return None
+    text = str(s)
+    m = re.search(r'\d{5,6}', text)
+    if m:
+        return m.group(0)
+    digits = re.sub(r'\D', '', text)
+    if len(digits) >= 5:
+        return digits[:6]
+    return None
+
+
+def parse_columns_list(arg: Optional[str], max_cols: int, default_cols: List[int]) -> List[int]:
+    if not arg:
+        return default_cols[:]
+    cols: List[int] = []
+    parts = [p.strip() for p in arg.split(",") if p.strip()]
+    for p in parts:
+        if re.match(r'^[A-Za-z]+$', p):
+            try:
+                idx = column_index_from_string(p) - 1
+                if 0 <= idx < max_cols:
+                    cols.append(idx)
+            except Exception:
+                continue
+        elif re.match(r'^\d+$', p):
+            v = int(p)
+            idx = v - 1
+            if 0 <= idx < max_cols:
+                cols.append(idx)
+    seen = set()
+    out = []
+    for c in cols:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out if out else default_cols[:]
+
+
+def _normalize_input_date_to_dateobj(s: str) -> Optional[date]:
+    """
+    Parse common date formats into a datetime.date object.
+    Returns None if parsing fails.
+    """
+    if not s:
+        return None
+    s = str(s).strip()
+    fmts = ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%Y/%m/%d")
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(s, fmt)
+            return date(dt.year, dt.month, dt.day)
+        except Exception:
+            pass
+    m = re.match(r'0?(\d{1,2})/0?(\d{1,2})/(\d{2,4})', s)
+    if m:
+        mm = int(m.group(1)); dd = int(m.group(2)); yy = int(m.group(3))
+        if yy < 100:
+            yy += 2000
+        try:
+            return date(yy, mm, dd)
+        except Exception:
+            return None
+    return None
+
+
+# ---------------------------
+# .xls reader (xlrd) helper
+# ---------------------------
+def read_xls_with_xlrd(path: str) -> Dict[str, pd.DataFrame]:
+    if not SUPPORT_XLS:
+        raise RuntimeError("xlrd not available. Install: pip install 'xlrd==1.2.0' or convert .xls to .xlsx")
+    book = xlrd.open_workbook(path, formatting_info=False, on_demand=False)
+    out: Dict[str, pd.DataFrame] = {}
+    for sheet in book.sheets():
+        rows = []
+        max_rows = max(sheet.nrows, 1000)
+        for r in range(max_rows):
+            try:
+                row_vals = []
+                has_data = False
+                for c in range(sheet.ncols):
+                    try:
+                        v = sheet.cell_value(r, c)
+                        ctype = sheet.cell_type(r, c)
+                        if ctype == xlrd.XL_CELL_DATE:
+                            try:
+                                dt_tuple = xlrd.xldate_as_tuple(v, book.datemode)
+                                row_vals.append(f"{dt_tuple[1]}/{dt_tuple[2]}/{dt_tuple[0]}")
+                                has_data = True
+                            except Exception:
+                                row_vals.append(str(v))
+                                if v != "":
+                                    has_data = True
+                        elif ctype != xlrd.XL_CELL_EMPTY:
+                            row_vals.append(v)
+                            if v != "":
+                                has_data = True
+                        else:
+                            row_vals.append("")
+                    except IndexError:
+                        row_vals.append("")
+                if has_data:
+                    rows.append(row_vals)
+                elif r > sheet.nrows and len(rows) > 0:
+                    break
+            except IndexError:
+                break
+        if rows:
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                header_row = 0
+                df.columns = [str(x) if x is not None else "" for x in df.iloc[header_row].tolist()]
+                df = df.iloc[header_row + 1:].reset_index(drop=True)
+            out[sheet.name] = df
+    return out
+
+
+# ---------------------------
+# Admin map loader and selector
+# ---------------------------
+def load_admin_map_csv(path: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Load CSV with columns: file_num, project_id, admin_rate, effective_from, effective_to, notes
+    Returns list of dict rows with parsed dates and floats.
+    """
+    rows: List[Dict[str, Any]] = []
+    if not path or not os.path.exists(path):
+        return rows
+    try:
+        with open(path, newline='', encoding='utf-8') as fh:
+            reader = csv.DictReader(fh)
+            for r in reader:
+                file_num = str(r.get('file_num') or '').strip() or None
+                project_id = str(r.get('project_id') or '').strip() or None
+                admin_rate = safe_float(r.get('admin_rate', 0.0))
+                eff_from = _normalize_input_date_to_dateobj((r.get('effective_from') or '').strip())
+                eff_to = _normalize_input_date_to_dateobj((r.get('effective_to') or '').strip())
+                rows.append({
+                    'file_num': file_num,
+                    'project_id': project_id,
+                    'admin_rate': float(admin_rate),
+                    'effective_from': eff_from,
+                    'effective_to': eff_to,
+                    'raw': r
+                })
+    except Exception:
+        pass
+    return rows
+
+
+def admin_rate_for(file_num: Optional[str], project_id: Optional[str],
+                   target_date: Optional[date], admin_map_rows: List[Dict[str, Any]],
+                   default_rate: float = 0.0) -> float:
+    """
+    Choose best admin_rate matching project/file and effective date.
+    Priority:
+      1) exact file_num + project_id with matching date range
+      2) file_num only with matching date range
+      3) project_id only with matching date range
+      4) fallback default_rate
+    """
+    if target_date is None:
+        target_date = date.today()
+
+    def in_range(row):
+        ef = row.get('effective_from')
+        et = row.get('effective_to')
+        if ef and target_date < ef:
+            return False
+        if et and target_date > et:
+            return False
+        return True
+
+    best_row: Optional[Dict[str, Any]] = None
+    # First try file_num + project_id
+    for row in admin_map_rows:
+        if file_num and project_id and row.get('file_num') == file_num and row.get('project_id') == project_id and in_range(row):
+            if best_row is None or (row.get('effective_from') or date(1900, 1, 1)) > (best_row.get('effective_from') or date(1900, 1, 1)):
+                best_row = row
+    if best_row:
+        return float(best_row.get('admin_rate') or 0.0)
+    # Then file_num only
+    for row in admin_map_rows:
+        if file_num and row.get('file_num') == file_num and in_range(row):
+            if best_row is None or (row.get('effective_from') or date(1900, 1, 1)) > (best_row.get('effective_from') or date(1900, 1, 1)):
+                best_row = row
+    if best_row:
+        return float(best_row.get('admin_rate') or 0.0)
+    # Then project_id only
+    for row in admin_map_rows:
+        if project_id and row.get('project_id') == project_id and in_range(row):
+            if best_row is None or (row.get('effective_from') or date(1900, 1, 1)) > (best_row.get('effective_from') or date(1900, 1, 1)):
+                best_row = row
+    if best_row:
+        return float(best_row.get('admin_rate') or 0.0)
+    return float(default_rate or 0.0)
+
+
+# ---------------------------
+# Improved Helpers to attach project blocks in a paysheet
+# ---------------------------
+def attach_project_blocks(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """
+    Improved block detection:
+    - Scans top->bottom for project header hints.
+    - When a header is found, also scans a small neighborhood (rows -3 .. +3, cols 0..11)
+      to find 'admin fee' tokens and a nearby numeric value and optional effective date.
+    """
+    nrows, ncols = df.shape
+    blocks: List[Dict[str, Any]] = []
+    keywords = ('1st project', '2nd project', '3rd project', 'project', 'rate', 'admin fee', 'adminfee', 'admin')
+    for r in range(nrows):
+        row_text = " ".join(str(df.iat[r, c] or "").strip() for c in range(min(12, ncols))).lower()
+        if any(k in row_text for k in keywords):
+            blk = {'start_row': r, 'project_id': None, 'admin_fee': None, 'rate': None, 'admin_eff_date': None, 'meta': {}}
+            # scan neighborhood rows for admin fee / rate tokens and numbers
+            for rr in range(max(0, r - 3), min(nrows, r + 4)):
+                for cc in range(min(12, ncols)):
+                    try:
+                        v = df.iat[rr, cc]
+                    except Exception:
+                        v = None
+                    if v is None:
+                        continue
+                    s = str(v).strip().lower()
+                    if 'admin' in s and ('fee' in s or 'admin' in s):
+                        # try to pick numeric to the right or left
+                        if cc + 1 < ncols:
+                            if blk['admin_fee'] is None:
+                                blk['admin_fee'] = safe_float(df.iat[rr, cc + 1])
+                        if cc - 1 >= 0 and blk['admin_fee'] in (None, 0.0):
+                            blk['admin_fee'] = safe_float(df.iat[rr, cc - 1])
+                        # try to find effective date in nearby cells
+                        for dcc in (cc + 2, cc + 3, cc - 1, cc - 2):
+                            if 0 <= dcc < ncols:
+                                dd = str(df.iat[rr, dcc] or "").strip()
+                                dt = _normalize_input_date_to_dateobj(dd)
+                                if dt:
+                                    blk['admin_eff_date'] = blk['admin_eff_date'] or dt
+                    if 'rate' in s and not blk.get('rate'):
+                        if cc + 1 < ncols:
+                            blk['rate'] = safe_float(df.iat[rr, cc + 1])
+                    # project id/name
+                    if ('project' in s or 'name' in s) and blk.get('project_id') is None:
+                        if cc + 1 < ncols:
+                            cand = str(df.iat[rr, cc + 1] or "").strip()
+                            if cand:
+                                blk['project_id'] = cand
+            blocks.append(blk)
+    if not blocks:
+        blocks = [{'start_row': 0, 'project_id': None, 'admin_fee': None, 'rate': None, 'admin_eff_date': None, 'meta': {}}]
+    blocks.sort(key=lambda x: x['start_row'])
+    return blocks
+
+
+def project_for_row(blocks: List[Dict[str, Any]], row_index: int) -> Dict[str, Any]:
+    chosen = blocks[0]
+    for b in blocks:
+        if b['start_row'] <= row_index:
+            chosen = b
+        else:
+            break
+    return chosen
+
+
+# ---------------------------
+# B/C-only paysheet parser
+# ---------------------------
+def parse_paysheet(
+    path: str,
+    month: int,
+    year: int,
+    debug_log: List[str],
+    bc_cols: Optional[List[int]] = None,
+    bc_scan_rows: Optional[int] = None,
+    bc_amt_search_width: int = 1,
+    bc_payment_min: float = 1.0
+) -> Tuple[float, float, Optional[float], Dict[str, Any]]:
+    """
+    Parse paysheet and return:
+      hours_sum, payments_sum, salary_value, meta
+    meta contains:
+      - 'bc_matches': list of tuples (r, col_idx, txt_raw, hours_col, hours_val, payment_val, project_id, paysheet_admin)
+    """
+    debug_log.append(f"\n{'='*72}")
+    debug_log.append(f"PARSING: {os.path.basename(path)}")
+    debug_log.append(f"{'='*72}")
+
+    hours_sum = 0.0
+    payments_sum = 0.0
+    salary_value = None
+    admin_fee_rate = None
+    meta: Dict[str, Any] = {"path": path, "notes": []}
+
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        dfs: Dict[str, pd.DataFrame] = {}
+
+        debug_log.append(f"File extension: {ext}")
+        if ext == ".xls":
+            try:
+                dfs = read_xls_with_xlrd(path)
+                debug_log.append("✓ Read using xlrd")
+            except Exception:
+                dfs = pd.read_excel(path, sheet_name=None, engine=None)
+                debug_log.append("✓ Read using pandas fallback")
+        else:
+            try:
+                dfs = pd.read_excel(path, sheet_name=None, engine=None)
+                debug_log.append("✓ Read using pandas")
+            except Exception:
+                dfs = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+                debug_log.append("✓ Read using openpyxl")
+
+        sheet_items = list(dfs.items())
+        selected_sheets = [(n, d) for (n, d) in sheet_items if str(year) in str(n)]
+        if not selected_sheets:
+            selected_sheets = sheet_items
+
+        first_num_re = re.compile(r'(\d{1,2})')
+        mm_plain = str(month)
+        mm_padded = f"{month:02d}"
+        start_re = re.compile(rf'^\s*(?:{re.escape(mm_padded)}|{re.escape(mm_plain)})(?:[/-]|\b)')
+
+        def first_numeric_token_from_text(s: Any) -> Optional[int]:
+            if s is None:
+                return None
+            txt = re.sub(r'[A-Za-z]+', '', str(s))
+            m = first_num_re.search(txt)
+            return int(m.group(1)) if m else None
+
+        for sname, df in selected_sheets:
+            debug_log.append(f"\n--- Sheet: {sname} ---")
+            if df is None or df.shape[1] == 0:
+                debug_log.append("  Skipping empty sheet")
+                continue
+
+            df2 = df.copy()
+            df2.columns = [str(c) if c is not None else "" for c in df2.columns]
+            nrows, ncols = df2.shape
+            debug_log.append(f"  Dimensions: {nrows} rows × {ncols} columns")
+
+            # admin fee hint detection
+            for r in range(min(20, nrows)):
+                for c in range(min(12, ncols)):
+                    try:
+                        v = df2.iat[r, c]
+                    except Exception:
+                        v = None
+                    if isinstance(v, str) and 'admin' in v.lower() and 'fee' in v.lower():
+                        try:
+                            admin_fee_rate = safe_float(df2.iat[r, c + 1]) if c + 1 < ncols else None
+                        except Exception:
+                            admin_fee_rate = None
+                        debug_log.append(f"  Admin fee hint at r{r} c{c}: {admin_fee_rate}")
+                        break
+                if admin_fee_rate:
+                    break
+
+            # Detect explicit payments header column in top area (fallback)
+            payment_header_col = None
+            for rr in range(min(12, nrows)):
+                for cc in range(min(12, ncols)):
+                    try:
+                        hv = df2.iat[rr, cc]
+                    except Exception:
+                        hv = None
+                    if hv is None:
+                        continue
+                    hs = str(hv).strip().lower()
+                    if any(k in hs for k in ("payment", "amount", "paid", "amount billed", "billed", "paid to", "salary paid")):
+                        payment_header_col = cc
+                        debug_log.append(f"  Detected payments header at r{rr} c{cc} ('{hv}')")
+                        break
+                if payment_header_col is not None:
+                    break
+
+            # prepare project blocks
+            blocks = attach_project_blocks(df2)
+
+            default_bc = [1, 2]
+            bc_cols_use = default_bc if bc_cols is None else [c for c in bc_cols if 0 <= c < ncols] or default_bc
+            rows_to_scan = nrows if (bc_scan_rows is None or bc_scan_rows <= 0) else min(bc_scan_rows, nrows)
+            debug_log.append(f"  B/C-only scan: cols={[get_column_letter(c+1) for c in bc_cols_use]} rows=1..{rows_to_scan}")
+
+            bc_matches: List[Tuple[int, int, str, int, float, float, Optional[str], Optional[float]]] = []
+            for r in range(rows_to_scan):
+                for col_idx in bc_cols_use:
+                    if col_idx >= ncols:
+                        continue
+                    try:
+                        raw = df2.iat[r, col_idx]
+                    except Exception:
+                        raw = None
+                    if raw is None:
+                        continue
+                    txt_raw = str(raw).strip()
+                    if not txt_raw:
+                        continue
+
+                    first_num = first_numeric_token_from_text(txt_raw)
+                    if first_num is None or first_num != month:
+                        continue
+
+                    txt_l = txt_raw.lower()
+                    looks_like_period = ('-' in txt_raw)
+                    is_pink = ('pink' in txt_l)
+                    starts_with_month = bool(start_re.search(txt_raw))
+
+                    exclude_keywords = ['rate eff', 'rate', 'admin fee', 'admin', 'paid to ee', 'paid to', 'payment not', 'payment', 'per ee', 'p/e', 'paid to client']
+                    if any(kw in txt_l for kw in exclude_keywords):
+                        debug_log.append(f"  B/C-skip r{r} col{col_idx+1}: '{txt_raw}' -> excluded by keyword")
+                        continue
+
+                    if not (looks_like_period or is_pink or starts_with_month):
+                        debug_log.append(f"  B/C-skip r{r} col{col_idx+1}: '{txt_raw}' -> month token present but cell not a period/pink/start")
+                        continue
+
+                    # hours only from immediate-right
+                    hours_col = col_idx + 1
+                    hours_val = 0.0
+                    if hours_col < ncols:
+                        try:
+                            hours_val = safe_float(df2.iat[r, hours_col])
+                        except Exception:
+                            hours_val = 0.0
+
+                    if not (hours_val > 0 and hours_val <= 500):
+                        debug_log.append(f"  B/C-skip r{r} col{col_idx+1}: '{txt_raw}' -> hours {hours_val} (<=0 or >500), skipped")
+                        continue
+
+                    # payment selection: prefer cell immediately after hours_col
+                    payment_val = 0.0
+                    payment_col = None
+                    right_of_hours = hours_col + 1
+                    if right_of_hours < ncols:
+                        try:
+                            pv = safe_float(df2.iat[r, right_of_hours])
+                        except Exception:
+                            pv = 0.0
+                        if pv >= float(bc_payment_min):
+                            payment_val = pv
+                            payment_col = right_of_hours
+                            debug_log.append(f"    Chosen payment from right-of-hours col {right_of_hours+1} = {payment_val}")
+
+                    # fallback to payment_header_col if right-of-hours not usable
+                    if (payment_val == 0.0 or payment_col is None) and payment_header_col is not None and 0 <= payment_header_col < ncols:
+                        try:
+                            pv2 = safe_float(df2.iat[r, payment_header_col])
+                        except Exception:
+                            pv2 = 0.0
+                        if pv2 >= float(bc_payment_min):
+                            payment_val = pv2
+                            payment_col = payment_header_col
+                            debug_log.append(f"    Fallback payment from header col {payment_header_col+1} = {payment_val}")
+
+                    # project assignment from blocks
+                    blk = project_for_row(blocks, r)
+                    proj_id = blk.get('project_id')
+                    paysheet_admin = blk.get('admin_fee')  # may be None
+
+                    bc_matches.append((r, col_idx, txt_raw, hours_col, hours_val, payment_val, proj_id, paysheet_admin))
+                    debug_log.append(
+                        f"  B/C-match r{r} col{col_idx+1}: '{txt_raw}' -> hours col {hours_col+1} = {hours_val}, "
+                        f"payment col {(payment_col+1) if payment_col is not None else 'N/A'} = {payment_val}, "
+                        f"proj='{proj_id}', paysheet_admin={paysheet_admin}"
+                    )
+
+            # Summarize sheet totals (for hours and payments)
+            if bc_matches:
+                sheet_hours = sum(m[4] for m in bc_matches)
+                sheet_payments = sum(m[5] for m in bc_matches)
+                hours_sum += sheet_hours
+                payments_sum += sheet_payments
+                debug_log.append(f"  B/C-scan matched {len(bc_matches)} rows; summed hours={sheet_hours}; summed payments={sheet_payments}")
+            else:
+                debug_log.append("  No accepted B/C matches found for this sheet (hours_sum/payments_sum unchanged)")
+
+            # attach matches to meta for caller to compute admin by project if desired
+            meta['bc_matches'] = meta.get('bc_matches', []) + bc_matches
+
+        debug_log.append(f"\n{'='*72}")
+        debug_log.append(f"TOTALS (B/C-only): {hours_sum:.4f} hours, ${payments_sum:.2f}")
+        debug_log.append(f"{'='*72}\n")
+        return round(hours_sum, 4), round(payments_sum, 2), salary_value, {"admin_fee_rate": admin_fee_rate, **meta}
+
+    except Exception as e:
+        debug_log.append(f"✗ CRITICAL ERROR in B/C-only parse_paysheet: {e}")
+        raise RuntimeError(f"Failed parsing {path}: {e}")
+
+
+# ---------------------------
+# Master helpers (kept)
+# ---------------------------
+def find_headers(ws: Worksheet, header_row: int, month_name: str) -> Dict[str, Optional[int]]:
+    headers: Dict[str, Optional[int]] = {}
+    header_cells: Dict[int, str] = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=header_row, column=c).value
+        if v is not None:
+            header_cells[c] = str(v).strip()
+
+    def find_by_keywords(keywords: List[str]) -> Optional[int]:
+        for c, text in header_cells.items():
+            tl = text.lower()
+            if any(k.lower() in tl for k in keywords):
+                return c
+        return None
+
+    headers['file_col'] = find_by_keywords(['applicant', 'file', 'file #', 'file#', 'ultra-staff'])
+    accr = billed = None
+    for c, text in header_cells.items():
+        t = text.lower()
+        if accr is None and month_name.lower() in t and 'hours' in t:
+            accr = c
+        if billed is None and month_name.lower() in t and 'billed' in t:
+            billed = c
+
+    headers['accrual_hours_col'] = accr
+    headers['billed_col'] = billed
+    headers['admin_fee_col'] = find_by_keywords(['admin fee', 'adminfee', 'admin'])
+    headers['wages_earned_col'] = find_by_keywords(['wages earned', 'wagesearned', 'wages'])
+    headers['salary_paid_col'] = find_by_keywords(['salary paid', 'salarypaid', 'salary'])
+    headers['payroll_name_col'] = find_by_keywords(['payroll name', 'consultant name', 'employee name', 'name'])
+    gross_col = find_by_keywords(['gross salary', 'grosssalary', 'gross'])
+    if gross_col is None and ws.max_column >= 22:
+        gross_col = 22
+    headers['gross_salary_col'] = gross_col
+    return headers
+
+
+def create_month_columns_if_missing(wb: openpyxl.Workbook, ws: Worksheet, header_row: int, month_name: str) -> Tuple[int, int]:
+    found = find_headers(ws, header_row, month_name)
+    accr = found.get('accrual_hours_col'); billed = found.get('billed_col')
+    if accr and billed:
+        return accr, billed
+    last = 1
+    for c in range(1, ws.max_column + 1):
+        if ws.cell(row=header_row, column=c).value not in (None, ""):
+            last = c
+    if not accr:
+        last += 1
+        ws.cell(row=header_row, column=last, value=f"{month_name} Hours")
+        accr = last
+    if not billed:
+        last += 1
+        ws.cell(row=header_row, column=last, value=f"{month_name} Billed to the Client")
+        billed = last
+    return accr, billed
+
+
+def unmerge_cell_if_merged(ws: Worksheet, row: int, col: int):
+    if not col:
+        return
+    coord = f"{get_column_letter(col)}{row}"
+    to_unmerge = []
+    for mr in ws.merged_cells.ranges:
+        if coord in mr:
+            to_unmerge.append(mr)
+    for mr in to_unmerge:
+        try:
+            ws.unmerge_cells(str(mr))
+        except Exception:
+            pass
+
+
+# ---------------------------
+# AccrualUpdater orchestration (writes payments + admin into master)
+# ---------------------------
+class AccrualUpdater:
+    def __init__(
+        self,
+        master_path: str,
+        sheet_name: str,
+        header_row: int,
+        month: str,
+        year: int,
+        paysheets_folder: str,
+        map_path: Optional[str],
+        dry_run: bool = False,
+        backup: bool = False,
+        folder_classify: bool = False,
+        bc_cols_arg: Optional[str] = None,
+        bc_scan_rows: Optional[int] = None,
+        bc_amt_search_width: int = 1,
+        bc_payment_min: float = 1.0,
+        admin_map_path: Optional[str] = None,
+        default_admin_rate: float = 0.0,
+        prefer_paysheet_admin: bool = True,
+        pay_dates: Optional[List[Tuple[date, float]]] = None,
+    ):
+        self.master_path = master_path
+        self.sheet_name = sheet_name
+        self.header_row = header_row
+        self.month = month
+        self.month_index = MONTHS.index(month) + 1
+        self.year = year
+        self.paysheets_folder = paysheets_folder
+        self.map_path = map_path
+        self.dry_run = dry_run
+        self.backup = backup
+        self.folder_classify = folder_classify
+        self.bc_cols_arg = bc_cols_arg
+        self.bc_scan_rows = bc_scan_rows
+        self.bc_amt_search_width = bc_amt_search_width
+        self.bc_payment_min = bc_payment_min
+        self.admin_map_path = admin_map_path or map_path
+        self.default_admin_rate = float(default_admin_rate or 0.0)
+        self.prefer_paysheet_admin = prefer_paysheet_admin
+        self.pay_dates = pay_dates or []
+        self.log_lines: List[str] = []
+        self.debug_log: List[str] = []
+        self.updated_count = 0
+        self.no_match_count = 0
+        self.failed_count = 0
+        self.start_time = None
+        # load admin_map once
+        self.admin_map_rows = load_admin_map_csv(self.admin_map_path) if self.admin_map_path else []
+
+    def log(self, line: str):
+        print(line)
+        self.log_lines.append(line)
+
+    def _classify_from_folder(self, fpath: str) -> Optional[str]:
+        try:
+            rel = os.path.relpath(fpath, self.paysheets_folder)
+            parts = [p.lower() for p in rel.split(os.sep) if p and not p.startswith('.')]
+            is_nle = any('nle' in p for p in parts)
+            is_hourly = any('hourly' in p for p in parts)
+            is_pi = any('pi' in p for p in parts)
+            if is_nle and is_pi:
+                return "NLE_PI"
+            if is_nle and is_hourly:
+                return "NLE_HOURLY"
+            if is_nle:
+                return "NLE"
+            if is_hourly:
+                return "Hourly"
+            if is_pi:
+                return "PI"
+            return None
+        except Exception:
+            return None
+
+    def _is_in_hourly_folder(self, fpath: str) -> bool:
+        try:
+            rel = os.path.relpath(fpath, self.paysheets_folder)
+            parts = [p.lower() for p in rel.split(os.sep) if p and not p.startswith('.')]
+            return any('hourly' in p for p in parts)
+        except Exception:
+            return False
+
+    def process(self):
+        self.start_time = time.time()
+        self.log("\n" + "=" * 80)
+        self.log("iTech Accrual Updater (B/C-only parser)")
+        self.log("=" * 80 + "\n")
+
+        if not os.path.exists(self.master_path):
+            raise RuntimeError(f"Master file not found: {self.master_path}")
+        if not os.path.exists(self.paysheets_folder):
+            raise RuntimeError(f"Paysheets folder not found: {self.paysheets_folder}")
+
+        self.log(f"Master: {self.master_path}")
+        self.log(f"Paysheets: {self.paysheets_folder}")
+        self.log(f"Month: {self.month} {self.year}\n")
+
+        wb = openpyxl.load_workbook(filename=self.master_path)
+        if self.sheet_name not in wb.sheetnames:
+            raise RuntimeError(f"Sheet '{self.sheet_name}' not found")
+        ws = wb[self.sheet_name]
+
+        headers = find_headers(ws, self.header_row, self.month)
+        accrual_col, billed_col = create_month_columns_if_missing(wb, ws, self.header_row, self.month)
+        headers = headers or {}
+        file_col = headers.get('file_col')
+        name_col = headers.get('payroll_name_col')
+        wages_col = headers.get('wages_earned_col')
+        salary_col = headers.get('salary_paid_col')
+        admin_col = headers.get('admin_fee_col')
+        gross_col = headers.get('gross_salary_col')
+
+        self.log(
+            f"Columns: Hours={get_column_letter(accrual_col)} Billed={get_column_letter(billed_col)} "
+            f"Gross={get_column_letter(gross_col) if gross_col else 'N/A'} Admin={get_column_letter(admin_col) if admin_col else 'N/A'}\n"
+        )
+
+        if not file_col or not accrual_col or not billed_col:
+            raise RuntimeError("Required columns not found!")
+
+        master_lookup: Dict[str, Dict[str, Any]] = {}
+        for r in range(self.header_row + 1, ws.max_row + 1):
+            try:
+                file_cell = ws.cell(row=r, column=file_col).value
+            except Exception:
+                file_cell = None
+            fnum = normalize_file_number(file_cell)
+            name_val = ws.cell(row=r, column=name_col).value if name_col else None
+            row_text = " ".join(str(ws.cell(row=r, column=c).value or "").strip() for c in range(1, min(ws.max_column + 1, 21))).lower()
+            name_lower = str(name_val or "").lower()
+
+            is_hourly = False
+            is_nle = False
+            if re.search(r'\(\s*hourly\s*\)', name_lower):
+                is_hourly = True
+            elif re.search(r'\bhourly\b', row_text) and not re.search(r'\bnle\b', row_text):
+                is_hourly = True
+            if re.search(r'\bnle\b', row_text):
+                is_nle = True
+
+            if is_hourly and not is_nle:
+                typ = "Hourly"
+            elif is_nle and not is_hourly:
+                typ = "NLE"
+            elif is_hourly and is_nle:
+                typ = "NLE"
+            else:
+                typ = "PI"
+
+            if fnum:
+                master_lookup[fnum] = {"row": r, "name": name_val, "emp_type": typ}
+
+        valid_exts = {'.xls', '.xlsx', '.xlsm'}
+        files: List[str] = []
+        for root, _, fnames in os.walk(self.paysheets_folder):
+            for fn in fnames:
+                if os.path.splitext(fn)[1].lower() in valid_exts:
+                    files.append(os.path.join(root, fn))
+
+        self.log(f"Found {len(files)} paysheet(s)\n")
+
+        bc_default = [1, 2]
+        bc_cols_indices = parse_columns_list(self.bc_cols_arg, ws.max_column, bc_default) if self.bc_cols_arg else bc_default
+        bc_scan_rows_effective = self.bc_scan_rows if (self.bc_scan_rows and self.bc_scan_rows > 0) else None
+
+        payment_column_n = 14  # Excel Column N
+
+        for idx, fp in enumerate(files, 1):
+            fname = os.path.basename(fp)
+            self.log(f"[{idx}/{len(files)}] {fname}")
+            fnum = extract_file_number_from_string(fname)
+            if not fnum:
+                try:
+                    ext = os.path.splitext(fp)[1].lower()
+                    inner = read_xls_with_xlrd(fp) if ext == ".xls" else pd.read_excel(fp, sheet_name=None)
+                    found = None
+                    if isinstance(inner, dict):
+                        for _, df in inner.items():
+                            for r in range(min(20, df.shape[0])):
+                                for c in range(min(10, df.shape[1])):
+                                    try:
+                                        v = df.iat[r, c]
+                                    except Exception:
+                                        v = None
+                                    maybe = extract_file_number_from_string(str(v))
+                                    if maybe:
+                                        found = maybe
+                                        break
+                                if found:
+                                    break
+                            if found:
+                                break
+                    if found:
+                        fnum = found
+                except Exception:
+                    pass
+            if not fnum:
+                self.no_match_count += 1
+                self.log("  ✗ NO FILE NUMBER")
+                continue
+            f_norm = normalize_file_number(fnum)
+            self.log(f"  File #: {f_norm}")
+            if f_norm not in master_lookup:
+                self.no_match_count += 1
+                self.log("  ✗ NOT IN MASTER")
+                continue
+            rec = master_lookup[f_norm]
+            row = rec["row"]
+            emp_name = rec["name"] or ""
+            emp_type = rec["emp_type"]
+
+            folder_type = self._classify_from_folder(fp)
+            if self.folder_classify and folder_type:
+                old = emp_type
+                if folder_type in ("Hourly", "NLE_HOURLLY"):
+                    emp_type = "Hourly"
+                elif folder_type == "NLE_PI":
+                    emp_type = "NLE_PI"
+                elif folder_type == "NLE":
+                    emp_type = "NLE"
+                elif folder_type == "PI":
+                    emp_type = "PI"
+                self.log(f"  → Folder override: {folder_type} (was: {old})")
+
+            self.log(f"  ✓ {emp_name} (Row {row}) type={emp_type}")
+
+            try:
+                hours, payments, salary_candidate, meta = parse_paysheet(
+                    fp,
+                    self.month_index,
+                    self.year,
+                    self.debug_log,
+                    bc_cols=bc_cols_indices,
+                    bc_scan_rows=bc_scan_rows_effective,
+                    bc_amt_search_width=self.bc_amt_search_width,
+                    bc_payment_min=self.bc_payment_min,
+                )
+                self.log(f"  → {hours:.4f}h, payments=${payments:.2f}")
+
+                paysheet_admin_fee_rate = meta.get('admin_fee_rate')
+                # compute admin by iterating meta['bc_matches'] and using paysheet admin first (if prefer_paysheet_admin),
+                # else use admin_map fallback by file+project and effective date (use month start as target_date)
+                admin_sum = 0.0
+                bc_matches = meta.get('bc_matches', [])
+                target_date = date(self.year, self.month_index, 1)
+                for (r_idx, col_idx, txt_raw, hours_col, hours_val, payment_val, proj_id, paysheet_admin) in bc_matches:
+                    chosen_rate = 0.0
+                    reason = ''
+                    if self.prefer_paysheet_admin and paysheet_admin and paysheet_admin > 0:
+                        chosen_rate = float(paysheet_admin)
+                        reason = "paysheet"
+                    else:
+                        # consult admin_map
+                        chosen_rate = admin_rate_for(f_norm, proj_id, target_date, self.admin_map_rows, None)
+                        if chosen_rate and chosen_rate > 0:
+                            reason = "admin_map"
+                        else:
+                            # try master existing admin column value (if present)
+                            master_admin_val = None
+                            try:
+                                if admin_col:
+                                    master_admin_val = safe_float(ws.cell(row=row, column=admin_col).value)
+                            except Exception:
+                                master_admin_val = None
+                            if master_admin_val and master_admin_val > 0:
+                                chosen_rate = float(master_admin_val)
+                                reason = "master_admin_col"
+                            else:
+                                # fallback default
+                                chosen_rate = float(self.default_admin_rate or 0.0)
+                                reason = "default"
+
+                    admin_for_row = round(hours_val * chosen_rate, 2)
+                    admin_sum += admin_for_row
+                    self.debug_log.append(f"    admin row r{r_idx+1}: hours={hours_val}, proj={proj_id}, rate={chosen_rate} ({reason}), admin={admin_for_row}")
+
+                paysheet_admin_fee_rate = paysheet_admin_fee_rate or None
+
+                # Unmerge cells before writing
+                salary_write_value = salary_candidate if salary_candidate is not None else 0.0
+                if emp_type in ("Hourly", "NLE"):
+                    salary_write_col = wages_col
+                else:
+                    salary_write_col = salary_col or wages_col
+
+                for col in (accrual_col, billed_col, admin_col, salary_write_col, payment_column_n):
+                    if col:
+                        unmerge_cell_if_merged(ws, row, col)
+
+                if not self.dry_run:
+                    if accrual_col:
+                        ws.cell(row=row, column=accrual_col, value=round(hours, 4))
+                    if billed_col:
+                        ws.cell(row=row, column=billed_col, value=round(payments, 2))
+                    if admin_col:
+                        ws.cell(row=row, column=admin_col, value=round(admin_sum, 2))
+                    if admin_col is None:
+                        # if no admin column, write admin into Column N as well (so it is visible)
+                        try:
+                            ws.cell(row=row, column=payment_column_n, value=round(payments, 2))
+                        except Exception:
+                            pass
+                    if admin_col and (emp_type == "PI" or emp_type == "NLE_PI") and paysheet_admin_fee_rate is not None:
+                        # keep earlier behavior for admin column if meant differently
+                        pass
+                    if salary_write_col and salary_write_value > 0:
+                        ws.cell(row=row, column=salary_write_col, value=round(salary_write_value, 2))
+
+                    # Write payments sum directly to Column N
+                    try:
+                        ws.cell(row=row, column=payment_column_n, value=round(payments, 2))
+                    except Exception:
+                        pass
+
+                self.updated_count += 1
+                self.log(f"  ✓ SUCCESS (admin=${admin_sum:.2f})")
+            except Exception as e:
+                self.failed_count += 1
+                self.log(f"  ✗ ERROR: {e}")
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        logs_dir = os.path.join(os.path.dirname(self.master_path), "Logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        if not self.dry_run and self.backup:
+            backup_name = os.path.splitext(self.master_path)[0] + f"_BACKUP_{ts}.xlsx"
+            shutil.copy2(self.master_path, backup_name)
+            self.log(f"✓ Backup: {backup_name}")
+        if not self.dry_run:
+            try:
+                wb.save(self.master_path)
+                self.log(f"✓ Saved: {self.master_path}")
+            except PermissionError:
+                updated_name = os.path.splitext(self.master_path)[0] + f"_UPDATED_{ts}.xlsx"
+                wb.save(updated_name)
+                self.log(f"⚠ Saved as: {updated_name}")
+
+        result_log = os.path.join(logs_dir, f"Results_{self.month}_{ts}.txt")
+        debug_log_path = os.path.join(logs_dir, f"DEBUG_{self.month}_{ts}.txt")
+        try:
+            with open(result_log, "w", encoding="utf-8") as fh:
+                for L in self.log_lines:
+                    fh.write(L + "\n")
+                total_time = time.time() - self.start_time
+                fh.write(f"\nUpdated: {self.updated_count} | No Match: {self.no_match_count} | Failed: {self.failed_count}\n")
+                fh.write(f"Duration: {int(total_time // 60)}m {int(total_time % 60)}s\n")
+            with open(debug_log_path, "w", encoding="utf-8") as fh:
+                for L in self.debug_log:
+                    fh.write(L + "\n")
+        except Exception as e:
+            self.log(f"✗ Log error: {e}")
+
+        self.log("\n" + "=" * 80)
+        self.log(f"✓ Updated: {self.updated_count}")
+        self.log(f"⚠ No Match: {self.no_match_count}")
+        self.log(f"✗ Failed: {self.failed_count}")
+        self.log("=" * 80 + "\n")
+        return {"updated": self.updated_count, "no_match": self.no_match_count, "failed": self.failed_count, "log_path": result_log, "debug_log_path": debug_log_path}
+
+
+# ---------------------------
+# CLI helpers
+# ---------------------------
+def parse_multiplier_input(s: str) -> float:
+    s = (s or "").strip()
+    if s == "":
+        return 1.0
+    s = s.replace(" ", "")
+    try:
+        if "/" in s:
+            f = Fraction(s)
+            return float(f)
+        else:
+            return float(s)
+    except Exception:
+        return 1.0
+
+
+def run_cli():
+    p = argparse.ArgumentParser(description="iTech Accrual Updater (B/C-only)")
+    p.add_argument("--master", required=True)
+    p.add_argument("--sheet", default="Profit Sharing")
+    p.add_argument("--header-row", type=int, default=3)
+    p.add_argument("--month", required=True, choices=MONTHS)
+    p.add_argument("--year", type=int, required=True)
+    p.add_argument("--paysheets", required=True)
+    p.add_argument("--map", help="Admin fee map file (CSV). Also used as admin_map if --admin-map not provided")
+    p.add_argument("--admin-map", help="Admin map CSV path with columns file_num,project_id,admin_rate,effective_from,effective_to")
+    p.add_argument("--default-admin-rate", type=float, default=0.0, help="Fallback admin rate if none found")
+    p.add_argument("--prefer-paysheet-admin", action="store_true", default=True, help="Prefer paysheet admin fee when present")
+    p.add_argument("--backup", action="store_true", default=False)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--folder-classify", action="store_true")
+    p.add_argument("--ask-paydates", action="store_true")
+    p.add_argument("--bc-cols", help="Comma-separated BC columns to scan (letters like B,C or numbers 2,3). Default 'B,C'.")
+    p.add_argument("--bc-rows", type=int, default=0, help="Number of rows to scan in B/C (0 = scan all rows).")
+    p.add_argument("--bc-amt-width", type=int, default=1, help="How many columns to search to the right for a payment when hours cell is present (default 1).")
+    p.add_argument("--bc-payment-min", type=float, default=1.0, help="Minimum numeric value to qualify as a payment (default 1.0).")
+    p.add_argument("--force-work-col", help="Force Work Period column (letter like I or 1-based number).")
+    p.add_argument("--force-hours-col", help="Force Hours column (letter or 1-based number).")
+    args = p.parse_args()
+
+    pay_dates: List[Tuple[date, float]] = []
+    if args.ask_paydates:
+        print("Enter pay dates one at a time... (press Enter to finish)")
+        while True:
+            raw_date = input("Enter a pay date (MM/DD/YY or MM/DD/YYYY) or press Enter to finish: ").strip()
+            if not raw_date:
+                break
+            d_obj = _normalize_input_date_to_dateobj(raw_date)
+            if not d_obj:
+                print(f"  Warning: could not parse date '{raw_date}'")
+                continue
+            mul_in = input(f"Enter multiplier for {raw_date} (examples: 40/80 or 0.5). Press Enter for 1: ").strip()
+            mul = parse_multiplier_input(mul_in)
+            pay_dates.append((d_obj, mul))
+            print(f"  Added: {d_obj.isoformat()} x {mul}")
+
+    bc_cols_list = None
+    if args.bc-cols:
+        try:
+            bc_cols_list = parse_columns_list(args.bc_cols, 1000, [1, 2])
+        except Exception:
+            bc_cols_list = [1, 2]
+
+    updater = AccrualUpdater(
+        master_path=args.master,
+        sheet_name=args.sheet,
+        header_row=args.header_row,
+        month=args.month,
+        year=args.year,
+        paysheets_folder=args.paysheets,
+        map_path=args.map,
+        dry_run=args.dry_run,
+        backup=args.backup,
+        folder_classify=args.folder_classify,
+        bc_cols_arg=args.bc_cols,
+        bc_scan_rows=(args.bc_rows if args.bc_rows > 0 else None),
+        bc_amt_search_width=args.bc_amt_width,
+        bc_payment_min=args.bc_payment_min,
+        admin_map_path=args.admin_map or args.map,
+        default_admin_rate=args.default_admin_rate,
+        prefer_paysheet_admin=args.prefer_paysheet_admin,
+        pay_dates=pay_dates,
+    )
+    res = updater.process()
+    print("Summary:", res)
+
+
+if __name__ == "__main__":
+    run_cli()
