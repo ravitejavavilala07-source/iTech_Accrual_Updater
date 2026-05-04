@@ -1,8 +1,25 @@
-Quick Install & Usage
+uick Install & Usage
+
 1) python -m venv .venv
-2) source .venv/bin/activate
+
+2) source .venv/bin/activate   (on Mac/Linux)
+   .venv\Scripts\activate       (on Windows)
+
 3) pip install --upgrade pip
-4) pip install -r requirements_polished.txt
+
+4) pip install -r requirements.txt
+
 5) python app_polished.py
-6) pyinstaller --onedir --windowed --name iTechAccrual app_polished.py
+
+6) Mac ONLY - Make run_gui.command executable:
+   chmod +x run_gui.command
+   Then double-click run_gui.command to launch
+
+7) pyinstaller --onedir --windowed --name iTechAccrual app_polished.py
+
 Do NOT commit builds, venv, or real payroll data.
+
+IMPORTANT: xlwings requires Excel to be installed on your system
+- Mac: Excel from Microsoft Office
+- Windows: Excel from Microsoft Office
+- Linux: LibreOffice Calc (partial support)

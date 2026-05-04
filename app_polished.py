@@ -144,7 +144,7 @@ class RunnerThread(QtCore.QThread):
     log_signal = QtCore.Signal(str)
     done_signal = QtCore.Signal()
     error_signal = QtCore.Signal(str)
-    def __init__(self, master, paysheets, month, year, dry_run, enable_accrual, enable_admin_fee, pay_dates):
+    def __init__(self, master, paysheets, month, year, dry_run, enable_accrual, enable_admin_fee, pay_dates, enable_carryforward=False):
         super().__init__()
         self.master = master
         self.paysheets = paysheets
@@ -154,6 +154,7 @@ class RunnerThread(QtCore.QThread):
         self.enable_accrual = enable_accrual and AccrualUpdater is not None
         self.enable_admin_fee = enable_admin_fee and ADMIN_FEE_AVAILABLE
         self.pay_dates = pay_dates
+        self.enable_carryforward = enable_carryforward
     def run(self):
         try:
             if self.enable_accrual:
@@ -174,6 +175,7 @@ class RunnerThread(QtCore.QThread):
                     date_multiplier_pairs=date_multiplier_pairs,
                     dry_run=self.dry_run,
                     backup=True,
+                    enable_carryforward=self.enable_carryforward,
                 )
                 result = updater.process()
                 for line in updater.log_lines:
@@ -215,7 +217,18 @@ class RunnerThread(QtCore.QThread):
                     return
                 updated = 0
                 skipped = 0
-                T_COL = 20
+                # Dynamically find Admin Fee column from header row
+                T_COL = None
+                for c in range(1, ws.max_column + 1):
+                    v = ws.cell(row=3, column=c).value
+                    if v and 'admin fee' in str(v).lower():
+                        T_COL = c
+                        break
+                if not T_COL:
+                    self.log_signal.emit("❌ Admin Fee column not found in header row 3")
+                    self.done_signal.emit()
+                    return
+                self.log_signal.emit(f"✓ Admin Fee column: {__import__('openpyxl.utils', fromlist=['get_column_letter']).get_column_letter(T_COL)} ({T_COL})\n")
                 for idx, psheet in enumerate(files, 1):
                     fname = os.path.basename(psheet)
                     m = re.search(r'_(\d{6})\.xls', fname)
@@ -362,6 +375,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.admin_fee.setChecked(ADMIN_FEE_AVAILABLE)
         self.admin_fee.setEnabled(ADMIN_FEE_AVAILABLE)
         opts.addWidget(self.admin_fee)
+        self.carryforward_cb = QtWidgets.QCheckBox("Carryforward (force on)")
+        self.carryforward_cb.setChecked(False)
+        self.carryforward_cb.setToolTip("Carryforward runs automatically in January.\nTick this to force it for any other month.")
+        opts.addWidget(self.carryforward_cb)
         opts.addStretch()
         main_layout.addLayout(opts)
         self.run_btn = QtWidgets.QPushButton("RUN UPDATE")
@@ -441,7 +458,8 @@ class MainWindow(QtWidgets.QMainWindow):
             master, paysheets, self.month_combo.currentText(),
             self.year_spin.value(), self.dry_run.isChecked(),
             self.accrual_cb.isChecked(), self.admin_fee.isChecked(),
-            self.pd_model.rows
+            self.pd_model.rows,
+            enable_carryforward=self.carryforward_cb.isChecked(),
         )
         self.runner.log_signal.connect(self.log.appendPlainText)
         self.runner.done_signal.connect(lambda: self.run_btn.setEnabled(True))
@@ -455,6 +473,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "month": self.month_combo.currentIndex(),
                 "year": self.year_spin.value(),
                 "dry_run": self.dry_run.isChecked(),
+                "carryforward": self.carryforward_cb.isChecked(),
                 "pay_dates": [(d.isoformat(), m) for d, m in self.pd_model.rows],
             }
             with open(CONFIG_FILE, "w") as f:
@@ -473,6 +492,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.month_combo.setCurrentIndex(cfg.get("month", 0))
             self.year_spin.setValue(cfg.get("year", datetime.now().year))
             self.dry_run.setChecked(cfg.get("dry_run", True))
+            self.carryforward_cb.setChecked(cfg.get("carryforward", False))
             for d_str, m in cfg.get("pay_dates", []):
                 try:
                     self.pd_model.add_row(datetime.fromisoformat(d_str).date(), m)

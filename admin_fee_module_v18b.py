@@ -10,6 +10,12 @@ except ImportError:
 
 MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 
+
+def year_in_sheet_name(year: int, name: str) -> bool:
+    """Word-boundary year match — mirrors accrual_updater.year_in_sheet_name."""
+    return bool(re.search(rf'(?<!\d){year}(?!\d)', str(name)))
+
+
 def safe_float(x: Any) -> float:
     try:
         if x is None: return 0.0
@@ -130,7 +136,7 @@ def calculate_admin_fee_for_paysheet(paysheet_path: str, month: int, year: int, 
         book = xlrd.open_workbook(paysheet_path, formatting_info=False)
         sheet = None
         for s in book.sheets():
-            if "2025" in s.name:
+            if year_in_sheet_name(year, s.name):
                 sheet = s
                 break
         if not sheet:
@@ -178,7 +184,7 @@ def calculate_admin_fee_for_paysheet(paysheet_path: str, month: int, year: int, 
             static_rate = find_static_admin_fee(sheet, hp_row, search_rows=10)
             
             if admin_fees_list and static_rate > 0:
-                admin_fees_list = [((1, 1, 2025), static_rate)] + admin_fees_list
+                admin_fees_list = [((1, 1, year), static_rate)] + admin_fees_list
                 if debug:
                     print(f"Found static Admin Fee ${static_rate:.2f} + Eff entries: {admin_fees_list}")
             elif admin_fees_list and debug:
