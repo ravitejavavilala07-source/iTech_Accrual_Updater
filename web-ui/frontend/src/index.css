@@ -1,0 +1,177 @@
+@import "@fontsource/geist-sans/400.css";
+@import "@fontsource/geist-sans/500.css";
+@import "@fontsource/geist-sans/600.css";
+@import "@fontsource/geist-sans/700.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 260 87% 3%;
+    --foreground: 40 6% 95%;
+    --hero-sub: 40 6% 82%;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: "Geist Sans", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+@layer utilities {
+  .font-display {
+    font-family: "General Sans", system-ui, -apple-system, sans-serif;
+  }
+
+  /* Brand gradient — used in headings + progress bar + accents */
+  .brand-gradient {
+    background-image: linear-gradient(to right, #6366f1, #a855f7, #fcd34d);
+  }
+  .brand-gradient-text {
+    background-image: linear-gradient(to right, #6366f1, #a855f7, #fcd34d);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* Hover lift — subtle, expensive-feeling */
+  .hover-lift {
+    transition: transform 280ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                box-shadow 280ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                border-color 200ms ease;
+  }
+  .hover-lift:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 28px -12px rgba(99, 102, 241, 0.45),
+                inset 0 1px 1px rgba(255, 255, 255, 0.14);
+  }
+
+  /* Focus ring — indigo */
+  .focus-ring:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.45);
+    border-color: rgba(99, 102, 241, 0.8);
+  }
+
+  /* Fade in up — stagger via inline delay */
+  @keyframes fadeInUp {
+    0% { opacity: 0; transform: translateY(8px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+  .anim-in {
+    animation: fadeInUp 360ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  /* Shimmer for progress bar fill */
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+  .shimmer {
+    background-image: linear-gradient(
+      100deg,
+      rgba(255,255,255,0) 30%,
+      rgba(255,255,255,0.35) 50%,
+      rgba(255,255,255,0) 70%
+    );
+    background-size: 200% 100%;
+    background-repeat: no-repeat;
+    animation: shimmer 1.6s linear infinite;
+  }
+
+  /* Soft pulse — subtle attention */
+  @keyframes pulseSoft {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+  }
+  .pulse-soft {
+    animation: pulseSoft 1.8s ease-in-out infinite;
+  }
+
+  /* Toast slide in from bottom */
+  @keyframes toastIn {
+    0% { opacity: 0; transform: translateY(20px) scale(0.96); }
+    100% { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .toast-in {
+    animation: toastIn 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  /* Soft scale press for buttons */
+  .press {
+    transition: transform 120ms ease;
+  }
+  .press:active:not(:disabled) {
+    transform: scale(0.98);
+  }
+
+  /* Scrollbar polish */
+  .pretty-scroll::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .pretty-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .pretty-scroll::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+  }
+  .pretty-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.16);
+  }
+
+  /* Reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    .anim-in, .toast-in, .pulse-soft, .shimmer {
+      animation: none !important;
+    }
+    .hover-lift {
+      transition: none !important;
+    }
+  }
+
+  .liquid-glass {
+    background: rgba(255, 255, 255, 0.01);
+    background-blend-mode: luminosity;
+    backdrop-filter: blur(4px);
+    border: none;
+    box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.1);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .liquid-glass::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1.4px;
+    background: linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.45) 0%,
+      rgba(255, 255, 255, 0.15) 20%,
+      rgba(255, 255, 255, 0) 40%,
+      rgba(255, 255, 255, 0) 60%,
+      rgba(255, 255, 255, 0.15) 80%,
+      rgba(255, 255, 255, 0.45) 100%
+    );
+    -webkit-mask:
+      linear-gradient(#fff 0 0) content-box,
+      linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+}

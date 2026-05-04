@@ -1,0 +1,67 @@
+name: Build Windows .exe
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:  # manual trigger from Actions tab
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web-ui/frontend/package-lock.json
+
+      - name: Build React frontend
+        working-directory: web-ui/frontend
+        run: |
+          npm ci || npm install
+          npm run build
+
+      - name: Install Python deps
+        working-directory: web-ui/backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pywin32
+
+      - name: Run PyInstaller
+        working-directory: web-ui/build
+        run: |
+          if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
+          if (Test-Path "dist")  { Remove-Item -Recurse -Force "dist" }
+          python -m PyInstaller accrual.spec --noconfirm
+
+      - name: Verify exe exists
+        working-directory: web-ui/build/dist
+        run: |
+          if (-not (Test-Path "7t-Accrual-Updater.exe")) { throw "exe missing" }
+          $size = (Get-Item "7t-Accrual-Updater.exe").Length / 1MB
+          Write-Host "✓ 7t-Accrual-Updater.exe ($([math]::Round($size,1)) MB)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 7t-Accrual-Updater-windows
+          path: web-ui/build/dist/7t-Accrual-Updater.exe
+          retention-days: 30
+
+      - name: Create release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: web-ui/build/dist/7t-Accrual-Updater.exe
+          generate_release_notes: true

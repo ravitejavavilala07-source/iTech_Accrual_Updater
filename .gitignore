@@ -13,6 +13,26 @@ dist/
 *.spec
 *_internal/
 .ipynb_checkpoints/
+
+# But DO commit the PyInstaller spec + build scripts under web-ui/build/
+!web-ui/build/
+web-ui/build/build/
+web-ui/build/dist/
+!web-ui/build/accrual.spec
+!web-ui/build/build-mac.sh
+!web-ui/build/build-windows.ps1
+
+# Frontend
+node_modules/
+web-ui/frontend/dist/
+*.tsbuildinfo
+.vite/
+
+# Runtime artifacts (never commit)
+web-ui/backend/bug_reports.jsonl
+web-ui/backend/bug_reports.jsonl.old
+web-ui/frontend/.claude/
+.claude/worktrees/
 .DS_Store
 Thumbs.db
 desktop.ini
